@@ -1,0 +1,4 @@
+interface:
+  display_name: "Visual Presentation Production"
+  short_description: "Create aligned 16:9 visual presentation decks"
+  default_prompt: "Use $visual-presentation-production to create a 16:9 image-based presentation with style approval and optional PPTX or PDF assembly."
