@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Validate approved 16:9 slide images and assemble optional PPTX/PDF outputs."""
+"""Validate an approved 16:9 deck and assemble its single PDF delivery."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -14,6 +15,19 @@ except ImportError as error:
     raise SystemExit("Pillow is required: python3 -m pip install pillow") from error
 
 
+OUTLINE_HEADING = re.compile(r"^## Slide (\d+) of (\d+)\s*$", re.MULTILINE)
+LAYOUT_FIELDS = (
+    "structure",
+    "title_position",
+    "text_region",
+    "visual_region",
+    "whitespace",
+    "page_number_position",
+    "density",
+)
+SOURCE_STATUSES = {"provided", "user-confirmed"}
+
+
 def load_manifest(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -21,29 +35,92 @@ def load_manifest(path: Path) -> dict:
         raise SystemExit(f"Cannot read manifest: {error}") from error
 
 
-def validate_manifest(data: dict) -> list[str]:
+def nonempty(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def expected_ids(count: int) -> list[str]:
+    return [str(index).zfill(2) for index in range(1, count + 1)]
+
+
+def validate_outline(path: Path, count: int) -> list[str]:
     errors: list[str] = []
-    count, slides = data.get("slide_count"), data.get("slides")
-    if not isinstance(count, int) or count < 2:
-        errors.append("slide_count must be an integer of at least 2")
-    if data.get("width_px") != 1920 or data.get("height_px") != 1080:
-        errors.append("this version requires 1920x1080 output")
-    if data.get("sample_approved") is not True:
-        errors.append("sample_approved must be true")
-    if data.get("all_text_frozen") is not True:
-        errors.append("all_text_frozen must be true")
-    if not isinstance(slides, list) or len(slides) != count:
-        errors.append("slides must contain exactly slide_count rows")
-        return errors
-    ids = [str(slide.get("id", "")) for slide in slides]
-    if len(ids) != len(set(ids)) or any(not item for item in ids):
-        errors.append("slide ids must be present and unique")
-    if any(slide.get("approved") is not True for slide in slides):
-        errors.append("every slide must be approved")
+    try:
+        outline = path.read_text(encoding="utf-8")
+    except OSError as error:
+        return [f"Cannot read outline: {error}"]
+    headings = OUTLINE_HEADING.findall(outline)
+    ids = [item[0].zfill(2) for item in headings]
+    totals = [int(item[1]) for item in headings]
+    if len(headings) != count:
+        errors.append("outline must contain exactly slide_count headings in '## Slide NN of TT' format")
+    if ids != expected_ids(count):
+        errors.append("outline slide ids must be sequential from 01 through slide_count")
+    if any(total != count for total in totals):
+        errors.append("every outline heading total must equal slide_count")
     return errors
 
 
-def normalize(source: Path, destination: Path) -> None:
+def validate_slide(slide: object, expected_id: str) -> list[str]:
+    if not isinstance(slide, dict):
+        return [f"slide_{expected_id} must be an object"]
+    errors: list[str] = []
+    if str(slide.get("id", "")).zfill(2) != expected_id:
+        errors.append(f"slide ids must be sequential; expected {expected_id}")
+    for field in ("role", "claim", "title", "visual"):
+        if not nonempty(slide.get(field)):
+            errors.append(f"slide_{expected_id}.{field} must be a non-empty string")
+    text = slide.get("text")
+    if not isinstance(text, list) or any(not nonempty(item) for item in text):
+        errors.append(f"slide_{expected_id}.text must be a list of non-empty strings")
+    if slide.get("source_status") not in SOURCE_STATUSES:
+        errors.append(f"slide_{expected_id}.source_status must be provided or user-confirmed")
+    layout = slide.get("layout")
+    if not isinstance(layout, dict):
+        errors.append(f"slide_{expected_id}.layout must be an object")
+    else:
+        for field in LAYOUT_FIELDS:
+            if not nonempty(layout.get(field)):
+                errors.append(f"slide_{expected_id}.layout.{field} must be a non-empty string")
+    style_rules = slide.get("style_rules")
+    if not isinstance(style_rules, list) or not style_rules or any(not nonempty(item) for item in style_rules):
+        errors.append(f"slide_{expected_id}.style_rules must be a non-empty list of strings")
+    if slide.get("approved") is not True:
+        errors.append(f"slide_{expected_id}.approved must be true")
+    return errors
+
+
+def validate_manifest(data: dict) -> list[str]:
+    errors: list[str] = []
+    if data.get("schema_version") != 2:
+        errors.append("schema_version must be 2")
+    count = data.get("slide_count")
+    if not isinstance(count, int) or count < 1:
+        errors.append("slide_count must be an integer of at least 1")
+        return errors
+    if data.get("width_px") != 1920 or data.get("height_px") != 1080:
+        errors.append("this version requires 1920x1080 output")
+    for field in ("brief_approved", "source_review_complete", "outline_approved", "sample_approved", "all_text_frozen"):
+        if data.get(field) is not True:
+            errors.append(f"{field} must be true")
+    if not nonempty(data.get("style_profile_version")):
+        errors.append("style_profile_version must be a non-empty string")
+    delivery = data.get("delivery")
+    if delivery != {"format": "PDF", "filename": "presentation.pdf"}:
+        errors.append("delivery must be exactly {'format': 'PDF', 'filename': 'presentation.pdf'}")
+    sample_slide = str(data.get("sample_slide", "")).zfill(2)
+    if sample_slide not in expected_ids(count):
+        errors.append("sample_slide must identify one slide in the approved range")
+    slides = data.get("slides")
+    if not isinstance(slides, list) or len(slides) != count:
+        errors.append("slides must contain exactly slide_count rows")
+        return errors
+    for slide, identifier in zip(slides, expected_ids(count)):
+        errors.extend(validate_slide(slide, identifier))
+    return errors
+
+
+def normalize(source: Path) -> Image.Image:
     with Image.open(source) as raw:
         raw.load()
         if abs(raw.width / raw.height - 16 / 9) > 0.02:
@@ -52,77 +129,66 @@ def normalize(source: Path, destination: Path) -> None:
     image = ImageOps.contain(image, (1920, 1080), Image.Resampling.LANCZOS)
     canvas = Image.new("RGB", (1920, 1080), "white")
     canvas.paste(image, ((1920 - image.width) // 2, (1080 - image.height) // 2))
+    return canvas
+
+
+def write_pdf(images: list[Image.Image], destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(destination, "PNG", optimize=True)
+    images[0].save(destination, "PDF", save_all=True, append_images=images[1:], resolution=150)
 
 
-def write_pdf(images: list[Path], destination: Path) -> None:
-    pages = [Image.open(path).convert("RGB") for path in images]
-    try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        pages[0].save(destination, "PDF", save_all=True, append_images=pages[1:], resolution=150)
-    finally:
-        for page in pages:
-            page.close()
-
-
-def write_pptx(images: list[Path], destination: Path) -> None:
-    try:
-        from pptx import Presentation
-        from pptx.util import Inches
-    except ImportError as error:
-        raise RuntimeError("python-pptx is required for PPTX assembly") from error
-    presentation = Presentation()
-    presentation.slide_width = Inches(13.333333)
-    presentation.slide_height = Inches(7.5)
-    blank = presentation.slide_layouts[6]
-    for image in images:
-        slide = presentation.slides.add_slide(blank)
-        slide.shapes.add_picture(str(image), 0, 0, width=presentation.slide_width, height=presentation.slide_height)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    presentation.save(destination)
+def write_report(path: Path, valid: bool, count: int | None, errors: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "valid": valid,
+        "delivery": "presentation.pdf",
+        "expected_slide_count": count,
+        "outline_page_count": count if valid else None,
+        "pdf_page_count": count if valid else None,
+        "errors": errors,
+    }
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, required=True)
+    parser.add_argument("--outline", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--pptx", type=Path)
-    parser.add_argument("--pdf", type=Path)
-    parser.add_argument("--report", type=Path)
+    parser.add_argument("--pdf", type=Path, required=True)
+    parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
+
     data = load_manifest(args.manifest)
+    count = data.get("slide_count") if isinstance(data.get("slide_count"), int) else None
     errors = validate_manifest(data)
-    final_images: list[Path] = []
-    if not errors:
-        for slide in data["slides"]:
-            identifier = str(slide["id"]).zfill(2)
+    if count is not None and count >= 1:
+        errors.extend(validate_outline(args.outline, count))
+
+    images: list[Image.Image] = []
+    if not errors and count is not None:
+        for identifier in expected_ids(count):
             source = args.input_dir / f"slide_{identifier}.png"
-            destination = args.out_dir / f"slide_{identifier}.png"
             if not source.exists():
                 errors.append(f"missing slide_{identifier}.png")
                 continue
             try:
-                normalize(source, destination)
-                final_images.append(destination)
+                images.append(normalize(source))
             except (OSError, ValueError) as error:
                 errors.append(str(error))
-    if not errors:
-        try:
-            if args.pdf:
-                write_pdf(final_images, args.pdf)
-            if args.pptx:
-                write_pptx(final_images, args.pptx)
-        except RuntimeError as error:
-            errors.append(str(error))
-    report_path = args.report or args.out_dir / "qa-report.json"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps({"valid": not errors, "errors": errors}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    try:
+        if not errors:
+            write_pdf(images, args.pdf)
+        write_report(args.report, not errors, count, errors)
+    finally:
+        for image in images:
+            image.close()
+
     if errors:
         print("Validation failed:\n" + "\n".join(f"- {item}" for item in errors))
         return 1
-    print(f"Prepared {len(final_images)} slides in {args.out_dir}")
+    print(f"Created {count}-page PDF at {args.pdf}")
     return 0
 
 
